@@ -29,7 +29,10 @@
 #include "rdb_listpack.h"
 #include "rdb_ziplist.h"
 #include "rdb_zipmap.h"
+#include "storage/redis_metadata.h"
 #include "time_util.h"
+#include "types/redis_bitmap.h"
+#include "types/redis_bitmap_string.h"
 #include "types/redis_hash.h"
 #include "types/redis_list.h"
 #include "types/redis_set.h"
@@ -64,7 +67,6 @@ constexpr const int RDBOpcodeSelectDB = 254;     /* DB number of the following k
 constexpr const int RDBOpcodeEof = 255;          /* End of the RDB file. */
 
 constexpr const int SupportedRDBVersion = 10;  // not been tested for version 11, so use this version with caution.
-constexpr const int MaxRDBVersion = 11;        // The current max rdb version supported by redis.
 
 constexpr const int RDBCheckSumLen = 8;                                        // rdb check sum length
 constexpr const int RestoreRdbVersionLen = 2;                                  // rdb version len in restore string
@@ -86,7 +88,7 @@ Status RDB::VerifyPayloadChecksum(const std::string_view &payload) {
   }
   auto footer = payload.substr(payload.size() - RestoreFooterLen);
   auto rdb_version = (footer[1] << 8) | footer[0];
-  // For now, the max redis rdb version is 11
+  // For now, the max redis rdb version is 12
   if (rdb_version > MaxRDBVersion) {
     return {Status::NotOK, fmt::format("invalid or unsupported rdb version: {}", rdb_version)};
   }
@@ -155,7 +157,7 @@ StatusOr<std::string> RDB::loadEncodedString() {
     unsigned char buf[4] = {0};
     if (len == RDBEncInt8) {
       auto next = GET_OR_RET(stream_->ReadByte());
-      return std::to_string(static_cast<int>(next));
+      return std::to_string(static_cast<int8_t>(next));
     } else if (len == RDBEncInt16) {
       GET_OR_RET(stream_->Read(reinterpret_cast<char *>(buf), 2));
       auto value = static_cast<uint16_t>(buf[0]) | (static_cast<uint16_t>(buf[1]) << 8);
@@ -384,7 +386,7 @@ StatusOr<std::vector<MemberScore>> RDB::LoadZSetWithZipList() {
   return zset;
 }
 
-Status RDB::Restore(const std::string &key, std::string_view payload, uint64_t ttl_ms) {
+Status RDB::Restore(engine::Context &ctx, const std::string &key, std::string_view payload, uint64_t ttl_ms) {
   rocksdb::Status db_status;
 
   // Check the checksum of the payload
@@ -394,7 +396,7 @@ Status RDB::Restore(const std::string &key, std::string_view payload, uint64_t t
 
   auto value = GET_OR_RET(loadRdbObject(type, key));
 
-  return saveRdbObject(type, key, value, ttl_ms);  // NOLINT
+  return saveRdbObject(ctx, type, key, value, ttl_ms);  // NOLINT
 }
 
 StatusOr<int> RDB::loadRdbType() {
@@ -402,7 +404,7 @@ StatusOr<int> RDB::loadRdbType() {
   return type;
 }
 
-StatusOr<RedisObjValue> RDB::loadRdbObject(int type, const std::string &key) {
+StatusOr<RedisObjValue> RDB::loadRdbObject(int type, [[maybe_unused]] const std::string &key) {
   if (type == RDBTypeString) {
     auto value = GET_OR_RET(LoadStringObject());
     return value;
@@ -455,12 +457,17 @@ StatusOr<RedisObjValue> RDB::loadRdbObject(int type, const std::string &key) {
   return {Status::RedisParseErr, fmt::format("unsupported type: {}", type)};
 }
 
-Status RDB::saveRdbObject(int type, const std::string &key, const RedisObjValue &obj, uint64_t ttl_ms) {
+Status RDB::saveRdbObject(engine::Context &ctx, int type, const std::string &key, const RedisObjValue &obj,
+                          uint64_t ttl_ms) {
   rocksdb::Status db_status;
   if (type == RDBTypeString) {
     const auto &value = std::get<std::string>(obj);
     redis::String string_db(storage_, ns_);
-    db_status = string_db.SetEX(key, value, ttl_ms);
+    uint64_t expire_ms = 0;
+    if (ttl_ms > 0) {
+      expire_ms = ttl_ms + util::GetTimeStampMS();
+    }
+    db_status = string_db.SetEX(ctx, key, value, expire_ms);
   } else if (type == RDBTypeSet || type == RDBTypeSetIntSet || type == RDBTypeSetListPack) {
     const auto &members = std::get<std::vector<std::string>>(obj);
     redis::Set set_db(storage_, ns_);
@@ -470,23 +477,23 @@ Status RDB::saveRdbObject(int type, const std::string &key, const RedisObjValue 
     for (const auto &member : members) {
       insert_members.emplace_back(member);
     }
-    db_status = set_db.Add(key, insert_members, &count);
+    db_status = set_db.Add(ctx, key, insert_members, &count);
   } else if (type == RDBTypeZSet || type == RDBTypeZSet2 || type == RDBTypeZSetListPack || type == RDBTypeZSetZipList) {
     const auto &member_scores = std::get<std::vector<MemberScore>>(obj);
     redis::ZSet zset_db(storage_, ns_);
     uint64_t count = 0;
-    db_status = zset_db.Add(key, ZAddFlags(0), const_cast<std::vector<MemberScore> *>(&member_scores), &count);
+    db_status = zset_db.Add(ctx, key, ZAddFlags(0), const_cast<std::vector<MemberScore> *>(&member_scores), &count);
   } else if (type == RDBTypeHash || type == RDBTypeHashListPack || type == RDBTypeHashZipList ||
              type == RDBTypeHashZipMap) {
     const auto &entries = std::get<std::map<std::string, std::string>>(obj);
-    std::vector<FieldValue> filed_values;
-    filed_values.reserve(entries.size());
+    std::vector<FieldValue> field_values;
+    field_values.reserve(entries.size());
     for (const auto &entry : entries) {
-      filed_values.emplace_back(entry.first, entry.second);
+      field_values.emplace_back(entry.first, entry.second);
     }
     redis::Hash hash_db(storage_, ns_);
     uint64_t count = 0;
-    db_status = hash_db.MSet(key, filed_values, false /*nx*/, &count);
+    db_status = hash_db.MSet(ctx, key, field_values, false /*nx*/, &count);
   } else if (type == RDBTypeList || type == RDBTypeListZipList || type == RDBTypeListQuickList ||
              type == RDBTypeListQuickList2) {
     const auto &elements = std::get<std::vector<std::string>>(obj);
@@ -498,7 +505,7 @@ Status RDB::saveRdbObject(int type, const std::string &key, const RedisObjValue 
       }
       redis::List list_db(storage_, ns_);
       uint64_t list_size = 0;
-      db_status = list_db.Push(key, insert_elements, false, &list_size);
+      db_status = list_db.Push(ctx, key, insert_elements, false, &list_size);
     }
   } else {
     return {Status::RedisExecErr, fmt::format("unsupported save type: {}", type)};
@@ -509,7 +516,7 @@ Status RDB::saveRdbObject(int type, const std::string &key, const RedisObjValue 
   // String type will use the SETEX, so just only set the ttl for other types
   if (ttl_ms > 0 && type != RDBTypeString) {
     redis::Database db(storage_, ns_);
-    db_status = db.Expire(key, ttl_ms + util::GetTimeStampMS());
+    db_status = db.Expire(ctx, key, ttl_ms + util::GetTimeStampMS());
   }
   return db_status.ok() ? Status::OK() : Status{Status::RedisExecErr, db_status.ToString()};
 }
@@ -548,7 +555,7 @@ bool RDB::isEmptyRedisObject(const RedisObjValue &value) {
 }
 
 // Load RDB file: copy from redis/src/rdb.c:branch 7.0, 76b9c13d.
-Status RDB::LoadRdb(uint32_t db_index, bool overwrite_exist_key) {
+Status RDB::LoadRdb(engine::Context &ctx, uint32_t db_index, bool overwrite_exist_key) {
   char buf[1024] = {0};
   GET_OR_RET(LogWhenError(stream_->Read(buf, 9)));
   buf[9] = '\0';
@@ -564,21 +571,20 @@ Status RDB::LoadRdb(uint32_t db_index, bool overwrite_exist_key) {
     return {Status::NotOK, fmt::format("Can't handle RDB format version {}", rdb_ver)};
   }
 
-  uint64_t expire_time = 0;
+  uint64_t expire_time_ms = 0;
   int64_t expire_keys = 0;
   int64_t load_keys = 0;
   int64_t empty_keys_skipped = 0;
-  auto now = util::GetTimeStampMS();
+  auto now_ms = util::GetTimeStampMS();
   uint32_t db_id = 0;
   uint64_t skip_exist_keys = 0;
   while (true) {
     auto type = GET_OR_RET(LogWhenError(loadRdbType()));
     if (type == RDBOpcodeExpireTime) {
-      expire_time = static_cast<uint64_t>(GET_OR_RET(LogWhenError(loadExpiredTimeSeconds())));
-      expire_time *= 1000;
+      expire_time_ms = static_cast<uint64_t>(GET_OR_RET(LogWhenError(loadExpiredTimeSeconds()))) * 1000;
       continue;
     } else if (type == RDBOpcodeExpireTimeMs) {
-      expire_time = GET_OR_RET(LogWhenError(loadExpiredTimeMilliseconds(rdb_ver)));
+      expire_time_ms = GET_OR_RET(LogWhenError(loadExpiredTimeMilliseconds(rdb_ver)));
       continue;
     } else if (type == RDBOpcodeFreq) {               // LFU frequency: not use in kvrocks
       GET_OR_RET(LogWhenError(stream_->ReadByte()));  // discard the value
@@ -634,15 +640,15 @@ Status RDB::LoadRdb(uint32_t db_index, bool overwrite_exist_key) {
         LOG(WARNING) << "skipping empty key: " << key;
       }
       continue;
-    } else if (expire_time != 0 &&
-               expire_time < now) {  // in redis this used to feed this deletion to any connected replicas
+    } else if (expire_time_ms != 0 &&
+               expire_time_ms < now_ms) {  // in redis this used to feed this deletion to any connected replicas
       expire_keys++;
       continue;
     }
 
     if (!overwrite_exist_key) {  // only load not exist key
       redis::Database redis(storage_, ns_);
-      auto s = redis.KeyExist(key);
+      auto s = redis.KeyExist(ctx, key);
       if (!s.IsNotFound()) {
         skip_exist_keys++;  // skip it even it's not okay
         if (!s.ok()) {
@@ -652,7 +658,7 @@ Status RDB::LoadRdb(uint32_t db_index, bool overwrite_exist_key) {
       }
     }
 
-    auto ret = saveRdbObject(type, key, value, expire_time);
+    auto ret = saveRdbObject(ctx, type, key, value, expire_time_ms);
     if (!ret.IsOK()) {
       LOG(WARNING) << "save rdb object key " << key << " failed: " << ret.Msg();
     } else {
@@ -679,4 +685,303 @@ Status RDB::LoadRdb(uint32_t db_index, bool overwrite_exist_key) {
             << ", empty keys skipped: " << empty_keys_skipped << skip_info;
 
   return Status::OK();
+}
+
+Status RDB::Dump(const std::string &key, const RedisType type) {
+  unsigned char buf[2];
+  /* Serialize the object in an RDB-like format. It consist of an object type
+   * byte followed by the serialized object. This is understood by RESTORE. */
+  auto s = SaveObjectType(type);
+  if (!s.IsOK()) return s;
+  s = SaveObject(key, type);
+  if (!s.IsOK()) return s;
+
+  /* Write the footer, this is how it looks like:
+   * ----------------+---------------------+---------------+
+   * ... RDB payload | 2 bytes RDB version | 8 bytes CRC64 |
+   * ----------------+---------------------+---------------+
+   * RDB version and CRC are both in little endian.
+   */
+
+  // We should choose the minimum RDB version for compatibility consideration.
+  // For the current DUMP implementation, it was supported since from the Redis 2.6,
+  // so we choose the RDB version of Redis 2.6 as the minimum version.
+  buf[0] = MinRDBVersion & 0xff;
+  buf[1] = (MinRDBVersion >> 8) & 0xff;
+  s = stream_->Write((const char *)buf, 2);
+  if (!s.IsOK()) return s;
+
+  /* CRC64 */
+  CHECK(dynamic_cast<RdbStringStream *>(stream_.get()) != nullptr);
+  std::string &output = static_cast<RdbStringStream *>(stream_.get())->GetInput();
+  uint64_t crc = crc64(0, (unsigned char *)(output.c_str()), output.length());
+  memrev64ifbe(&crc);
+  return stream_->Write((const char *)(&crc), 8);
+}
+
+Status RDB::SaveObjectType(const RedisType type) {
+  int robj_type = -1;
+  if (type == kRedisString || type == kRedisBitmap) {
+    robj_type = RDBTypeString;
+  } else if (type == kRedisHash) {
+    robj_type = RDBTypeHash;
+  } else if (type == kRedisList) {
+    robj_type = RDBTypeListQuickList;
+  } else if (type == kRedisSet) {
+    robj_type = RDBTypeSet;
+  } else if (type == kRedisZSet) {
+    robj_type = RDBTypeZSet2;
+  } else {
+    LOG(WARNING) << "Invalid or Not supported object type: " << type;
+    return {Status::NotOK, "Invalid or Not supported object type"};
+  }
+  return stream_->Write((const char *)(&robj_type), 1);
+}
+
+Status RDB::SaveObject(const std::string &key, const RedisType type) {
+  engine::Context ctx(storage_);
+  if (type == kRedisString) {
+    std::string value;
+    redis::String string_db(storage_, ns_);
+    auto s = string_db.Get(ctx, key, &value);
+    if (!s.ok() && !s.IsNotFound()) {
+      return {Status::RedisExecErr, s.ToString()};
+    }
+    return SaveStringObject(value);
+  } else if (type == kRedisList) {
+    std::vector<std::string> elems;
+    redis::List list_db(storage_, ns_);
+    auto s = list_db.Range(ctx, key, 0, -1, &elems);
+    if (!s.ok() && !s.IsNotFound()) {
+      return {Status::RedisExecErr, s.ToString()};
+    }
+    return SaveListObject(elems);
+  } else if (type == kRedisSet) {
+    redis::Set set_db(storage_, ns_);
+    std::vector<std::string> members;
+    auto s = set_db.Members(ctx, key, &members);
+    if (!s.ok()) {
+      return {Status::RedisExecErr, s.ToString()};
+    }
+    return SaveSetObject(members);
+  } else if (type == kRedisZSet) {
+    redis::ZSet zset_db(storage_, ns_);
+    std::vector<MemberScore> member_scores;
+    RangeScoreSpec spec;
+    auto s = zset_db.RangeByScore(ctx, key, spec, &member_scores, nullptr);
+    if (!s.ok()) {
+      return {Status::RedisExecErr, s.ToString()};
+    }
+    std::sort(member_scores.begin(), member_scores.end(),
+              [](const MemberScore &v1, const MemberScore &v2) { return v1.score > v2.score; });
+    return SaveZSetObject(member_scores);
+  } else if (type == kRedisHash) {
+    redis::Hash hash_db(storage_, ns_);
+    std::vector<FieldValue> field_values;
+    auto s = hash_db.GetAll(ctx, key, &field_values);
+    if (!s.ok()) {
+      return {Status::RedisExecErr, s.ToString()};
+    }
+
+    return SaveHashObject(field_values);
+  } else if (type == kRedisBitmap) {
+    std::string value;
+    redis::Bitmap bitmap_db(storage_, ns_);
+    Config *config = storage_->GetConfig();
+    uint32_t max_btos_size = static_cast<uint32_t>(config->max_bitmap_to_string_mb) * MiB;
+    auto s = bitmap_db.GetString(ctx, key, max_btos_size, &value);
+    if (!s.ok() && !s.IsNotFound()) {
+      return {Status::RedisExecErr, s.ToString()};
+    }
+    return SaveStringObject(value);
+  } else {
+    LOG(WARNING) << "Invalid or Not supported object type: " << type;
+    return {Status::NotOK, "Invalid or Not supported object type"};
+  }
+}
+
+Status RDB::RdbSaveLen(uint64_t len) {
+  unsigned char buf[2];
+  if (len < (1 << 6)) {
+    /* Save a 6 bit len */
+    buf[0] = (len & 0xFF) | (RDB6BitLen << 6);
+    return stream_->Write((const char *)buf, 1);
+  } else if (len < (1 << 14)) {
+    /* Save a 14 bit len */
+    buf[0] = ((len >> 8) & 0xFF) | (RDB14BitLen << 6);
+    buf[1] = len & 0xFF;
+    return stream_->Write((const char *)buf, 2);
+  } else if (len <= UINT32_MAX) {
+    /* Save a 32 bit len */
+    buf[0] = RDB32BitLen;
+    auto status = stream_->Write((const char *)buf, 1);
+    if (!status.IsOK()) return status;
+
+    uint32_t len32 = htonl(len);
+    return stream_->Write((const char *)(&len32), 4);
+  } else {
+    /* Save a 64 bit len */
+    buf[0] = RDB64BitLen;
+    auto status = stream_->Write((const char *)buf, 1);
+    if (!status.IsOK()) return status;
+
+    len = htonu64(len);
+    return stream_->Write((const char *)(&len), 8);
+  }
+}
+
+Status RDB::SaveStringObject(const std::string &value) {
+  const size_t len = value.length();
+  int enclen = 0;
+
+  // When the length is less than 11, value may be an integer,
+  // so special encoding is performed.
+  if (len <= 11) {
+    unsigned char buf[5];
+    // convert string to long long
+    auto parse_result = ParseInt<long long>(value, 10);
+    if (parse_result) {
+      long long integer_value = *parse_result;
+      // encode integer
+      enclen = rdbEncodeInteger(integer_value, buf);
+      if (enclen > 0) {
+        return stream_->Write((const char *)buf, enclen);
+      }
+    }
+  }
+
+  // Since we do not support rdb compression,
+  // the lzf encoding method has not been implemented yet.
+
+  /* Store verbatim */
+  auto status = RdbSaveLen(value.length());
+  if (!status.IsOK()) return status;
+  if (value.length() > 0) {
+    return stream_->Write(value.c_str(), value.length());
+  }
+  return Status::OK();
+}
+
+Status RDB::SaveListObject(const std::vector<std::string> &elems) {
+  if (elems.size() > 0) {
+    auto status = RdbSaveLen(elems.size());
+    if (!status.IsOK()) return status;
+
+    for (const auto &elem : elems) {
+      auto status = rdbSaveZipListObject(elem);
+      if (!status.IsOK()) return status;
+    }
+  } else {
+    LOG(WARNING) << "the size of elems is zero";
+    return {Status::NotOK, "the size of elems is zero"};
+  }
+  return Status::OK();
+}
+
+Status RDB::SaveSetObject(const std::vector<std::string> &members) {
+  if (members.size() > 0) {
+    auto status = RdbSaveLen(members.size());
+    if (!status.IsOK()) return status;
+
+    for (const auto &elem : members) {
+      status = SaveStringObject(elem);
+      if (!status.IsOK()) return status;
+    }
+  } else {
+    LOG(WARNING) << "the size of elems is zero";
+    return {Status::NotOK, "the size of elems is zero"};
+  }
+  return Status::OK();
+}
+
+Status RDB::SaveZSetObject(const std::vector<MemberScore> &member_scores) {
+  if (member_scores.size() > 0) {
+    auto status = RdbSaveLen(member_scores.size());
+    if (!status.IsOK()) return status;
+
+    for (const auto &elem : member_scores) {
+      status = SaveStringObject(elem.member);
+      if (!status.IsOK()) return status;
+
+      status = rdbSaveBinaryDoubleValue(elem.score);
+      if (!status.IsOK()) return status;
+    }
+  } else {
+    LOG(WARNING) << "the size of member_scores is zero";
+    return {Status::NotOK, "the size of ZSet is 0"};
+  }
+  return Status::OK();
+}
+
+Status RDB::SaveHashObject(const std::vector<FieldValue> &field_values) {
+  if (field_values.size() > 0) {
+    auto status = RdbSaveLen(field_values.size());
+    if (!status.IsOK()) return status;
+
+    for (const auto &p : field_values) {
+      status = SaveStringObject(p.field);
+      if (!status.IsOK()) return status;
+
+      status = SaveStringObject(p.value);
+      if (!status.IsOK()) return status;
+    }
+  } else {
+    LOG(WARNING) << "the size of field_values is zero";
+    return {Status::NotOK, "the size of Hash is 0"};
+  }
+  return Status::OK();
+}
+
+int RDB::rdbEncodeInteger(const long long value, unsigned char *enc) {
+  if (value >= -(1 << 7) && value <= (1 << 7) - 1) {
+    enc[0] = (RDBEncVal << 6) | RDBEncInt8;
+    enc[1] = value & 0xFF;
+    return 2;
+  } else if (value >= -(1 << 15) && value <= (1 << 15) - 1) {
+    enc[0] = (RDBEncVal << 6) | RDBEncInt16;
+    enc[1] = value & 0xFF;
+    enc[2] = (value >> 8) & 0xFF;
+    return 3;
+  } else if (value >= -((long long)1 << 31) && value <= ((long long)1 << 31) - 1) {
+    enc[0] = (RDBEncVal << 6) | RDBEncInt32;
+    enc[1] = value & 0xFF;
+    enc[2] = (value >> 8) & 0xFF;
+    enc[3] = (value >> 16) & 0xFF;
+    enc[4] = (value >> 24) & 0xFF;
+    return 5;
+  } else {
+    return 0;
+  }
+}
+
+Status RDB::rdbSaveBinaryDoubleValue(double val) {
+  memrev64ifbe(&val);
+  return stream_->Write((const char *)(&val), sizeof(val));
+}
+
+Status RDB::rdbSaveZipListObject(const std::string &elem) {
+  // calc total ziplist size
+  uint prevlen = 0;
+  const size_t ziplist_size = zlHeaderSize + zlEndSize + elem.length() +
+                              ZipList::ZipStorePrevEntryLength(nullptr, 0, prevlen) +
+                              ZipList::ZipStoreEntryEncoding(nullptr, 0, elem.length());
+  auto zl_string = std::string(ziplist_size, '\0');
+  auto zl_ptr = reinterpret_cast<unsigned char *>(&zl_string[0]);
+
+  // set ziplist header
+  ZipList::SetZipListBytes(zl_ptr, ziplist_size, (static_cast<uint32_t>(ziplist_size)));
+  ZipList::SetZipListTailOffset(zl_ptr, ziplist_size, intrev32ifbe(zlHeaderSize));
+
+  // set ziplist entry
+  auto pos = ZipList::GetZipListEntryHead(zl_ptr, ziplist_size);
+  pos += ZipList::ZipStorePrevEntryLength(pos, ziplist_size, prevlen);
+  pos += ZipList::ZipStoreEntryEncoding(pos, ziplist_size, elem.length());
+  assert(pos + elem.length() <= zl_ptr + ziplist_size);
+  memcpy(pos, elem.c_str(), elem.length());
+
+  // set ziplist end
+  ZipList::SetZipListLength(zl_ptr, ziplist_size, 1);
+  zl_ptr[ziplist_size - 1] = zlEnd;
+
+  return SaveStringObject(zl_string);
 }

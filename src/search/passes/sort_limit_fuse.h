@@ -20,25 +20,24 @@
 
 #pragma once
 
-#include <map>
-#include <string_view>
+#include <memory>
 
-#include "common/status.h"
+#include "search/ir.h"
+#include "search/ir_pass.h"
+#include "search/ir_plan.h"
 
-class ZipList {
- public:
-  explicit ZipList(std::string_view input) : input_(input){};
-  ~ZipList() = default;
+namespace kqir {
 
-  StatusOr<std::string> Next();
-  StatusOr<std::vector<std::string>> Entries();
+struct SortLimitFuse : Visitor {
+  std::unique_ptr<Node> Visit(std::unique_ptr<Limit> node) override {
+    node = Node::MustAs<Limit>(Visitor::Visit(std::move(node)));
 
- private:
-  std::string_view input_;
-  uint64_t pos_ = 0;
-  uint32_t pre_entry_len_ = 0;
+    if (auto sort = Node::As<Sort>(std::move(node->op))) {
+      return std::make_unique<TopNSort>(std::move(sort->op), std::move(sort->order), std::move(node->limit));
+    }
 
-  Status peekOK(size_t n);
-  void setPreEntryLen(uint32_t len) { pre_entry_len_ = len; }
-  static uint32_t getEncodedLengthSize(uint32_t len);
+    return node;
+  }
 };
+
+}  // namespace kqir
